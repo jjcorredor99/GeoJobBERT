@@ -1,0 +1,16 @@
+version: "3.9"
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: jobs_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: jobsdb
+      POSTGRES_USER: jobs_user
+      POSTGRES_PASSWORD: jobs_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./db_data:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
