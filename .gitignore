@@ -1,0 +1,9 @@
+0_preprocesisng/
+*.pt
+*.env
+.env
+.env.prod
+*.pdf
+*-docx
+__pycache__
+*.zipS
