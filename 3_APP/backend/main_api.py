@@ -1,17 +1,12 @@
-import os
-import math
-from typing import List, Optional
+# backend/main_api.py
 
-import torch
-import torch.nn.functional as F
+from typing import List
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-from backend.utils.encode_latlon import GeoFourierEncoder
-from model.siames import SiameseTwoTower  
-from .db_connection import get_conn
-from .models_db import VacancyDB
-from .schemas import (
+from db_connection import get_conn
+from schemas import (
     VacancyCreate,
     VacancyUpdate,
     VacancyOut,
@@ -24,22 +19,17 @@ from .schemas import (
     VectorSearchResponse,
     VectorSearchMatch,
     VacancyEmbeddingIn,
-    VacancyEmbeddingOut)
-
-from .utils.affinity_calc import compute_affinity
-
-# ---------- Config general ----------
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-MODEL_PATH = os.path.join(BASE_DIR, "model", "nn.pt")
-
-
-
+    VacancyEmbeddingOut,
+)
+from utils.affinity_calc import compute_affinity
 
 app = FastAPI(
     title="Vacantes Matching API",
     version="2.0.0",
-    description="API CRUD de vacantes/candidatos + matching por embeddings con modelo siamesa.",
+    description=(
+        "API CRUD de vacantes/candidatos + matching de afinidad "
+        "entre CV y vacante usando el modelo actual."
+    ),
 )
 
 app.add_middleware(
@@ -49,11 +39,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
-
-
-
 
 
 # ======================
@@ -130,7 +115,7 @@ def get_vacancy(vacancy_id: int):
 
 @app.put("/vacancies/{vacancy_id}", response_model=VacancyOut)
 def update_vacancy(vacancy_id: int, vac_in: VacancyCreate):
-    # Para simplificar, PUT espera todos los campos (no patch)
+    # Para simplificar, PUT espera todos los campos (no patch parcial)
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -182,7 +167,6 @@ def delete_vacancy(vacancy_id: int):
     return {"ok": True}
 
 
-# --- Embedding de vacante ---
 @app.put("/vacancies/{vacancy_id}/embedding", response_model=VacancyOut)
 def update_vacancy_embedding(vacancy_id: int, emb: VacancyEmbeddingIn):
     with get_conn() as conn:
@@ -203,41 +187,6 @@ def update_vacancy_embedding(vacancy_id: int, emb: VacancyEmbeddingIn):
         raise HTTPException(status_code=404, detail="Vacante no encontrada")
 
     return VacancyOut(**row)
-
-
-# # --- Vector search en vacantes ---
-# @app.post("/vacancies/vector-search", response_model=List[VacancyWithScore])
-# def vector_search_vacancies(req: VectorSearchRequest):
-#     try:
-#         q = _l2_normalize(req.embedding)
-#     except ValueError as e:
-#         raise HTTPException(status_code=400, detail=str(e))
-
-#     with get_conn() as conn:
-#         with conn.cursor() as cur:
-#             cur.execute(
-#                 """
-#                 SELECT id, title, description, salary, skills, sectors, lat, lon, remote, embedding
-#                 FROM vacancies
-#                 WHERE embedding IS NOT NULL
-#                 """
-#             )
-#             rows = cur.fetchall()
-
-#     scored: List[VacancyWithScore] = []
-#     for row in rows:
-#         emb = row.get("embedding")
-#         if not emb:
-#             continue
-#         if len(emb) != len(q):
-#             continue
-
-#         score = _dot(q, emb)
-#         base = VacancyOut(**row)
-#         scored.append(VacancyWithScore(**base.dict(), score=score))
-
-#     scored.sort(key=lambda x: x.score, reverse=True)
-#     return scored[: req.top_k]
 
 
 # ======================
@@ -392,9 +341,7 @@ def apply_to_vacancy(req: ApplyRequest):
     if not req.cv_text.strip():
         raise HTTPException(status_code=400, detail="El CV no puede estar vacío")
 
-
-    text = create_vacant_text(vacancy)
-
+    # compute_affinity se encarga de construir textos y combinar con la localización
     affinity = compute_affinity(
         vacancy,
         req.cv_text,
@@ -407,3 +354,51 @@ def apply_to_vacancy(req: ApplyRequest):
         affinity=affinity,
         affinity_percent=affinity * 100.0,
     )
+
+
+# ======================
+#   BÚSQUEDA POR SIMILARIDAD
+# ======================
+
+@app.post("/vacancies/vector-search", response_model=VectorSearchResponse)
+def vector_search_vacancies(req: VectorSearchRequest):
+    """
+    Búsqueda de vacantes similares a un CV usando compute_affinity.
+    Recorrer todas las vacantes puede ser suficiente si el volumen es pequeño.
+    """
+    cv_text = (req.cv_text or "").strip()
+    if not cv_text:
+        raise HTTPException(status_code=400, detail="El CV no puede estar vacío")
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, title, description, salary, skills, sectors, lat, lon, remote, embedding
+                FROM vacancies
+                ORDER BY id
+                """
+            )
+            rows = cur.fetchall()
+
+    matches: List[VectorSearchMatch] = []
+    for row in rows:
+        vacancy = VacancyOut(**row)
+
+        try:
+            score = compute_affinity(
+                vacancy,
+                cv_text,
+                req.candidate_lat,
+                req.candidate_lon,
+            )
+        except Exception:
+            # Si hay algún problema con una vacante concreta, la saltamos
+            continue
+
+        matches.append(VectorSearchMatch(vacancy=vacancy, similarity=score))
+
+    matches.sort(key=lambda m: m.similarity, reverse=True)
+    top_matches = matches[: req.top_k]
+
+    return VectorSearchResponse(matches=top_matches)

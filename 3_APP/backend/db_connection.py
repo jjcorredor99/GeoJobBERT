@@ -20,7 +20,7 @@ poc_host="localhost"
 poc_database="vector_store_jobs"
 poc_port=5432
 
-DATABASE_URL = f"postgresql://{poc_user}:{poc_password}@{poc_host}:5432/{poc_database}"
+DATABASE_URL = "postgresql://postgres.mloiyszhesiikueylruv:Sn8NUhuMFVHRB2wN@aws-0-us-west-2.pooler.supabase.com:6543/postgres"
 
 
 def get_conn():

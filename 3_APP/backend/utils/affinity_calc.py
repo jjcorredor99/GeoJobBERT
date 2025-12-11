@@ -3,27 +3,38 @@ from typing import Any, List, Optional
 
 import numpy as np
 import torch
-from transformers import AutoTokenizer
+import torch.nn.functional as F
+from sentence_transformers import SentenceTransformer
 
-from model.siames import SiameseTwoTower
-from backend.utils.chunker import chunker
-from backend.utils.encode_latlon import GeoFourierEncoder
+from utils.encode_latlon import GeoFourierEncoder
 from models_db import VacancyDB, CandidateDB
+from model.Model import HybridEmbedder  # <- your hybrid model
+
+from dotenv import load_dotenv
+
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # backend
+MODEL_NAME = "hybrid_lochead_final.pt"
+MODEL_PATH = os.path.join(BASE_DIR, "model", MODEL_NAME)
+# Cargar variables de entorno desde 3_APP/.env.prod (si existe)
+
+load_dotenv(os.path.join(BASE_DIR, ".env.prod"))
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-MODEL_PATH = os.path.join(BASE_DIR, "model", "nn.pt")
-GEO_B_PATH = os.path.join(BASE_DIR, "geo_B.npy")  # same folder as encode_latlon/geo_B.npy
 
-MAX_LENGTH = 384
+
+# Matriz B de Fourier (si la usas)
+GEO_B_PATH = os.path.join(BASE_DIR, "geo_B.npy")  # mismo folder que encode_latlon
+
+# Defaults; FOURIER_D will be overwritten from checkpoint if present
 FOURIER_D = 8
 FOURIER_SCALES = (1200, 400, 150, 50)
 FOURIER_SEED = 0
 
-_model: Optional[torch.nn.Module] = None
-_tokenizer: Optional[AutoTokenizer] = None
+_hybrid_model: Optional[HybridEmbedder] = None
+_base_model: Optional[SentenceTransformer] = None
 _geo_encoder: Optional[GeoFourierEncoder] = None
+_fourier_dim: Optional[int] = None
 
 
 # ---------- small helpers ----------
@@ -85,7 +96,7 @@ def build_text_candidate(candidate: CandidateDB) -> str:
     return " ".join(p for p in parts if p)
 
 
-def build_text_vacancy(vacancy: VacancyDB) -> str:
+def build_text_vacancy(vacancy: VacancyDB | Any) -> str:
     parts: List[str] = []
 
     base_desc = (
@@ -99,7 +110,7 @@ def build_text_vacancy(vacancy: VacancyDB) -> str:
     parts.append(format_section("habilidades", _safe_get(vacancy, "skill_names", [])))
     parts.append(format_section("sectores", _safe_get(vacancy, "sector_names", [])))
 
-    min_salary = _safe_get(vacancy, "min_salary", None)
+    min_salary = _safe_get(vacancy, "min_salary", None) or _safe_get(vacancy, "salary", None)
     if min_salary is not None:
         parts.append(f"salario: {min_salary}")
 
@@ -109,10 +120,20 @@ def build_text_vacancy(vacancy: VacancyDB) -> str:
 # ---------- geo encoder ----------
 
 def _get_geo_encoder() -> GeoFourierEncoder:
-    global _geo_encoder
+    """
+    Lazily create the GeoFourierEncoder with the same dimensionality
+    as the model was trained on (from checkpoint config).
+    """
+    global _geo_encoder, _fourier_dim
+
     if _geo_encoder is None:
+        # ensure _fourier_dim is set from checkpoint
+        if _fourier_dim is None:
+            _ = load_model()  # sets _fourier_dim
+
+        D = int(_fourier_dim or FOURIER_D)
         enc = GeoFourierEncoder(
-            D=FOURIER_D,
+            D=D,
             scales_km=FOURIER_SCALES,
             seed=FOURIER_SEED,
         )
@@ -122,7 +143,7 @@ def _get_geo_encoder() -> GeoFourierEncoder:
     return _geo_encoder
 
 
-def build_fourier(obj: VacancyDB | CandidateDB) -> torch.Tensor:
+def build_fourier(obj: VacancyDB | CandidateDB | Any) -> torch.Tensor:
     lat = _safe_get(obj, "lat", None)
     lon = _safe_get(obj, "lon", None)
     if lat is None or lon is None:
@@ -133,137 +154,151 @@ def build_fourier(obj: VacancyDB | CandidateDB) -> torch.Tensor:
     return torch.from_numpy(feats).float()  # [1, D]
 
 
-# ---------- tokenizer + model ----------
-
-def _get_tokenizer() -> AutoTokenizer:
-    global _tokenizer
-    if _tokenizer is None:
-        model_name = os.getenv("model_name") or os.getenv("MODEL_NAME")
-        if not model_name:
-            raise RuntimeError("Env var 'model_name' (or 'MODEL_NAME') must be set")
-        _tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
-    return _tokenizer
+def build_fourier_from_latlon(lat: float, lon: float) -> torch.Tensor:
+    """
+    Convenience helper used when we only have raw coordinates instead of
+    a full VacancyDB/CandidateDB object.
+    """
+    enc = _get_geo_encoder()
+    feats = enc.transform([[lat, lon]])  # (1, D)
+    return torch.from_numpy(feats).float()  # [1, D]
 
 
-def load_model() -> SiameseTwoTower:
-    global _model
-    if _model is not None:
-        return _model
+# ---------- Hybrid model loading ----------
+
+def load_model() -> HybridEmbedder:
+    """
+    Load the HybridEmbedder + base SentenceTransformer from the
+    hybrid_lochead_final.pt checkpoint.
+    """
+    global _hybrid_model, _base_model, _fourier_dim
+
+    if _hybrid_model is not None:
+        return _hybrid_model
 
     if not os.path.exists(MODEL_PATH):
-        raise RuntimeError(f"Modelo nn.pt no encontrado en {MODEL_PATH}")
+        print(MODEL_PATH, "MODELOOOOO")
+        raise RuntimeError(f"Modelo hybrid_lochead_final.pt no encontrado en {MODEL_PATH}")
 
-    m = torch.load(MODEL_PATH, map_location=DEVICE)
-    if not isinstance(m, torch.nn.Module):
-        raise RuntimeError("nn.pt debe contener el modelo completo (nn.Module).")
+    ckpt = torch.load(MODEL_PATH, map_location=DEVICE)
 
-    m.to(DEVICE)
-    m.eval()
-    _model = m
-    return _model
-
-
-# ---------- chunks -> [B, C, T] tensors ----------
-
-def _chunks_to_tensor_from_chunker(
-    chunks_dict: dict,
-    name: str,
-    tokenizer: AutoTokenizer,
-    max_length: int = MAX_LENGTH,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    chunker(...) returns lists of ids per chunk under keys:
-        f"{name}_chunks_input_ids", f"{name}_chunks_attention_mask"
-    We turn them into [1, C, T] tensors (B=1).
-    """
-    ids_list = chunks_dict.get(f"{name}_chunks_input_ids", [])
-    mask_list = chunks_dict.get(f"{name}_chunks_attention_mask", [])
-
-    # no text -> single empty chunk
-    if not ids_list:
-        enc = tokenizer(
-            "",
-            truncation=True,
-            max_length=max_length,
-            padding="max_length",
-            return_tensors="pt",
+    if not isinstance(ckpt, dict) or "model_state_dict" not in ckpt:
+        print(MODEL_PATH, "ACÁAAA DICE")
+        raise RuntimeError(
+            "El archivo de modelo debe ser un checkpoint dict con 'model_state_dict'. "
+            "Asegúrate de guardar con torch.save({...}) como en el notebook."
         )
-        return enc["input_ids"].unsqueeze(1), enc["attention_mask"].unsqueeze(1)
 
-    pad_id = tokenizer.pad_token_id or 0
+    cfg = ckpt.get("model_config", {}) or {}
 
-    C = len(ids_list)
-    T = min(
-        max(len(ch) for ch in ids_list),
-        max_length,
+    # fourier_dim saved during training
+    _fourier_dim = int(cfg.get("fourier_dim", 0)) or FOURIER_D
+
+    # --- IMPORTANT PART ---
+    # Base model used in training (e.g. "/content/.../base-best_3/checkpoint-76104")
+    ckpt_base = cfg.get("base_model_path")
+
+    # Optional override if you moved that directory in this environment
+    env_override = os.getenv("HYBRID_BASE_MODEL_PATH", "C:/Users/JuanJoseCorredor/OneDrive - PSYCONOMETRICS SAS/Documentos/uniandes/Tesis 2/3_APP/backend/model/checkpoint-76104")
+    print(env_override)
+    if env_override:
+        base_model_path = env_override
+    elif ckpt_base and os.path.exists(ckpt_base):
+        base_model_path = ckpt_base
+    else:
+        raise RuntimeError(
+            "No se pudo determinar la ruta del modelo base para HybridEmbedder.\n"
+            " - En el checkpoint, 'base_model_path' es: "
+            f"{ckpt_base}\n"
+            " - Define la variable de entorno HYBRID_BASE_MODEL_PATH apuntando al "
+            "directorio local de ese SentenceTransformer (el mismo que usaste al entrenar)."
+        )
+
+    _base_model = SentenceTransformer(base_model_path, device=str(DEVICE))
+
+    proj_dim = int(cfg.get("proj_dim", 256))
+    loc_out_dim = int(cfg.get("loc_out_dim", 32))
+
+    model = HybridEmbedder(
+        base_model=_base_model,
+        fourier_dim=_fourier_dim,
+        proj_dim=proj_dim,
+        loc_out_dim=loc_out_dim,
     )
+    model.load_state_dict(ckpt["model_state_dict"])
+    model.to(DEVICE)
+    model.eval()
 
-    input_ids = torch.full((1, C, T), pad_id, dtype=torch.long)
-    attention_mask = torch.zeros((1, C, T), dtype=torch.long)
+    # freeze encoder, just in case
+    for p in model.base_model.parameters():
+        p.requires_grad = False
 
-    for i, ids in enumerate(ids_list):
-        l = min(len(ids), T)
-        input_ids[0, i, :l] = torch.tensor(ids[:l], dtype=torch.long)
-        attention_mask[0, i, :l] = 1
-
-    return input_ids, attention_mask
+    _hybrid_model = model
+    return _hybrid_model
 
 
-# ---------- main API ----------
-
-def compute_affinity(candidate: CandidateDB, vacancy: VacancyDB) -> float:
+def _encode_with_fourier(text: str, loc_fourier: torch.Tensor) -> torch.Tensor:
     """
-    Compute P(match | candidate, vacancy) in [0,1]
-    using the trained SiameseTwoTower + TextTower + geo features.
+    Encode a single (text, loc_fourier) pair into a L2-normalized embedding [D_emb].
+    text: str
+    loc_fourier: [1, F]
     """
+    if not text or not text.strip():
+        raise ValueError("El texto para el encoder no puede estar vacío")
+
     model = load_model()
-    tokenizer = _get_tokenizer()
+    assert _base_model is not None
 
-    # 1) build texts
-    job_text = build_text_vacancy(vacancy)
-    cand_text = build_text_candidate(candidate)
+    # Tokenize with the SentenceTransformer base model
+    features = _base_model.tokenize([text])
+    features = {k: v.to(DEVICE) for k, v in features.items()}
 
-    # 2) chunk them
-    chunks = chunker(
-        {"job": job_text, "cand": cand_text},
-        tokenizer=tokenizer,
-        max_length=MAX_LENGTH,
-    )
+    loc_fourier = loc_fourier.to(DEVICE).float()
+    if loc_fourier.dim() == 1:
+        loc_fourier = loc_fourier.unsqueeze(0)  # [1, F]
 
-    job_input_ids, job_attention_mask = _chunks_to_tensor_from_chunker(
-        chunks, "job", tokenizer, MAX_LENGTH
-    )
-    cand_input_ids, cand_attention_mask = _chunks_to_tensor_from_chunker(
-        chunks, "cand", tokenizer, MAX_LENGTH
-    )
-
-    # 3) geo features + remote flag
-    vac_fou = build_fourier(vacancy)      # [1, D]
-    cand_fou = build_fourier(candidate)   # [1, D]
-
-    remote_val = _safe_get(vacancy, "remote", 0)
-    vac_remote = torch.tensor(
-        [1.0 if remote_val else 0.0], dtype=torch.float32
-    )  # [1]
-
-    # 4) batch for SiameseTwoTower
-    batch = {
-        "job_input_ids": job_input_ids.to(DEVICE),            # [1, C_job, T]
-        "job_attention_mask": job_attention_mask.to(DEVICE),  # [1, C_job, T]
-        "cand_input_ids": cand_input_ids.to(DEVICE),          # [1, C_cand, T]
-        "cand_attention_mask": cand_attention_mask.to(DEVICE),
-        "vac_loc_fourier": vac_fou.to(DEVICE),                # [1, D]
-        "cand_loc_fourier": cand_fou.to(DEVICE),              # [1, D]
-        "vacant_remote": vac_remote.to(DEVICE),               # [1]
-    }
-
-    # 5) forward + sigmoid
     with torch.no_grad():
-        z_job, z_cand, logit_scale = model(batch)
-        # optional safety clamp in case InfoNCE pushed scale very high
-        if isinstance(logit_scale, torch.Tensor):
-            logit_scale = logit_scale.clamp(max=100.0)
-        logits = (z_job * z_cand).sum(dim=-1) * logit_scale
-        prob = torch.sigmoid(logits)[0].item()
+        embs = model(features, loc_fourier)  # [1, D]
+        embs = F.normalize(embs, p=2, dim=-1)
 
-    return float(prob)
+    return embs[0]  # [D]
+
+
+# ---------- main affinity function (used by /apply & test_model_only) ----------
+
+def compute_affinity(
+    vacancy: Any,
+    cv_text: str,
+    candidate_lat: Optional[float] = None,
+    candidate_lon: Optional[float] = None,
+) -> float:
+    """
+    Compute an affinity in [0,1] between a vacancy and a candidate CV text,
+    using the HybridEmbedder (SentenceTransformer + Fourier geo features).
+    """
+    cv_text = (cv_text or "").strip()
+    if not cv_text:
+        return 0.0
+
+    # 1) Build textual representations
+    job_text = build_text_vacancy(vacancy)
+
+    # 2) Geo Fourier features
+    vac_four = build_fourier(vacancy)  # [1, F]
+
+    if candidate_lat is not None and candidate_lon is not None:
+        cand_four = build_fourier_from_latlon(candidate_lat, candidate_lon)  # [1, F]
+    else:
+        # If we don't know candidate location, fall back to zeros so that
+        # location does not contribute to the similarity.
+        cand_four = torch.zeros_like(vac_four)
+
+    # 3) Encode both sides with the hybrid model
+    job_emb = _encode_with_fourier(job_text, vac_four)   # [D]
+    cand_emb = _encode_with_fourier(cv_text, cand_four)  # [D]
+
+    # 4) Cosine similarity in [-1, 1] -> affinity in [0, 1]
+    sim = F.cosine_similarity(job_emb, cand_emb, dim=0).item()
+    affinity = (sim + 1.0) / 2.0
+
+    return float(affinity)

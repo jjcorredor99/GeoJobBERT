@@ -110,3 +110,25 @@ VALUES
     -3.7038,
     FALSE
   );
+  -- Crear usuario de la app
+CREATE USER vector_store_jobs WITH PASSWORD 'jobs_password';
+
+-- Darle acceso a la base
+GRANT CONNECT ON DATABASE vector_store_jobs TO vector_store_jobs;
+
+-- Dar permisos sobre el esquema public
+GRANT USAGE ON SCHEMA public TO vector_store_jobs;
+
+-- Permisos sobre las tablas existentes
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO vector_store_jobs;
+
+-- Permisos sobre tablas futuras
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO vector_store_jobs;
+
+CREATE EXTENSION IF NOT EXISTS vector;
+
+
+ALTER TABLE vacancies
+  ADD COLUMN embedding vector(256);  -- use your actual dimension
+

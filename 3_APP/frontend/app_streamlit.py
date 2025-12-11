@@ -12,6 +12,36 @@ st.set_page_config(
     layout="centered",
 )
 
+def similarity_to_color(sim_percent: float) -> str:
+    """
+    Devuelve un color de marcador en función del % de similitud/afinidad.
+    """
+    if sim_percent >= 80:
+        return "darkgreen"
+    if sim_percent >= 60:
+        return "green"
+    if sim_percent >= 40:
+        return "orange"
+    return "red"
+
+
+@st.cache_data(show_spinner=False)
+def search_vacancies_by_cv(cv_text: str, cand_lat: float | None, cand_lon: float | None, top_k: int = 10):
+    """
+    Llama a POST /vacancies/vector-search del backend usando el CV del candidato
+    y su ubicación aproximada. Devuelve el JSON completo.
+    """
+    payload = {
+        "cv_text": cv_text,
+        "candidate_lat": cand_lat,
+        "candidate_lon": cand_lon,
+        "top_k": top_k,
+    }
+
+    resp = requests.post(f"{BACKEND_URL}/vacancies/vector-search", json=payload)
+    resp.raise_for_status()
+    return resp.json()
+
 
 # -----------------------------
 # Helpers de backend
@@ -47,15 +77,11 @@ def format_location(vacancy: dict) -> str:
     lon = vacancy.get("lon")
     remote = vacancy.get("remote")
 
-    has_coords = lat is not None and lon is not None
 
-    if remote and has_coords:
-        return f"Híbrido · lat {lat:.4f}, lon {lon:.4f}"
-    if remote and not has_coords:
+    if remote:
         return "Remoto"
-    if has_coords:
+    else:
         return f"Presencial · lat {lat:.4f}, lon {lon:.4f}"
-    return "Ubicación no especificada"
 
 
 # -----------------------------
@@ -330,6 +356,210 @@ def main():
 
         except requests.exceptions.RequestException as e:
             st.error(f"Error de conexión con el backend: {e}")
+
+
+    st.markdown("---")
+    st.subheader("5. Ver vacantes recomendadas para mi CV")
+
+    top_k = st.slider(
+        "¿Cuántas recomendaciones quieres ver?",
+        min_value=3,
+        max_value=30,
+        value=10,
+        step=1,
+        help="Usa el mismo modelo de matching para buscar vacantes similares a tu CV.",
+    )
+
+    # Estado para guardar el resultado de la búsqueda
+    if "reco_result" not in st.session_state:
+        st.session_state["reco_result"] = None
+
+    # Botón para lanzar la búsqueda y almacenar el resultado
+    if st.button("🔍 Buscar vacantes recomendadas"):
+        if not cv_text.strip():
+            st.error("Por favor, pega tu CV antes de buscar vacantes recomendadas.")
+        else:
+            try:
+                with st.spinner("Buscando vacantes similares a tu perfil..."):
+                    search_result = search_vacancies_by_cv(
+                        cv_text=cv_text,
+                        cand_lat=cand_lat,
+                        cand_lon=cand_lon,
+                        top_k=top_k,
+                    )
+
+                # Guardamos en sesión lo necesario para pintar luego
+                st.session_state["reco_result"] = {
+                    "search_result": search_result,
+                    "cand_lat": cand_lat,
+                    "cand_lon": cand_lon,
+                    "top_k": top_k,
+                }
+
+            except requests.exceptions.RequestException as e:
+                st.error(f"Error de conexión con el backend (vector-search): {e}")
+
+    # ------------------------------
+    # Mostrar resultados SI existen en sesión
+    # ------------------------------
+    reco_state = st.session_state.get("reco_result")
+    if reco_state is not None:
+        search_result = reco_state["search_result"]
+        cand_lat = reco_state["cand_lat"]
+        cand_lon = reco_state["cand_lon"]
+        top_k = reco_state["top_k"]
+
+        matches = search_result.get("matches", [])
+        if not matches:
+            st.info("No se encontraron vacantes recomendadas para este CV.")
+        else:
+            st.success(
+                f"Encontramos {len(matches)} vacantes recomendadas (mostrando hasta {top_k})."
+            )
+
+            # ===============================
+            # MAPA ÚNICO DE VACANTES RECOMENDADAS
+            # ===============================
+            vacancy_points = []
+            for m in matches:
+                v = m.get("vacancy", {})
+                v_lat = v.get("lat")
+                v_lon = v.get("lon")
+                if v_lat is None or v_lon is None:
+                    continue
+
+                sim = float(m.get("similarity", 0.0))
+                sim_percent = sim * 100.0
+                vacancy_points.append(
+                    (float(v_lat), float(v_lon), v, sim_percent)
+                )
+
+            if vacancy_points:
+                st.markdown("#### 🗺 Mapa de vacantes recomendadas")
+
+                # Centro del mapa: candidato si existe, si no la primera vacante
+                if cand_lat is not None and cand_lon is not None:
+                    map_center = [cand_lat, cand_lon]
+                else:
+                    map_center = [vacancy_points[0][0], vacancy_points[0][1]]
+
+                rec_map = folium.Map(
+                    location=map_center,
+                    zoom_start=10,
+                    tiles="CartoDB positron",
+                )
+
+                # Marcador del candidato (perfil)
+                if cand_lat is not None and cand_lon is not None:
+                    folium.Marker(
+                        [cand_lat, cand_lon],
+                        tooltip="Tu perfil",
+                        icon=folium.Icon(color="blue", icon="user"),
+                    ).add_to(rec_map)
+
+                # --- Pequeño ruido para vacantes con misma ubicación ---
+                # 1) Contar cuántas vacantes comparten coordenadas exactas
+                coords_count = {}
+                for v_lat, v_lon, _, _ in vacancy_points:
+                    key = (v_lat, v_lon)
+                    coords_count[key] = coords_count.get(key, 0) + 1
+
+                # 2) Llevar la cuenta de cuántas veces hemos usado ya esas coords
+                used_for_coord = {}
+
+                bounds = []
+                if cand_lat is not None and cand_lon is not None:
+                    bounds.append([cand_lat, cand_lon])
+
+                # Marcadores de las vacantes recomendadas
+                for v_lat, v_lon, v, sim_percent in vacancy_points:
+                    key = (v_lat, v_lon)
+                    idx_same = used_for_coord.get(key, 0)
+                    used_for_coord[key] = idx_same + 1
+                    n_same = coords_count[key]
+
+                    # Ruido solo si hay más de una vacante en el mismo punto
+                    if n_same > 1:
+                        jitter_step = 0.0005  # ~50 m aprox
+                        offset = (idx_same - (n_same - 1) / 2) * jitter_step
+                        lat_j = v_lat + offset
+                        lon_j = v_lon + offset
+                    else:
+                        lat_j = v_lat
+                        lon_j = v_lon
+
+                    color = similarity_to_color(sim_percent)
+
+                    popup_html = f"""
+                    <b>{v.get('id', '?')} · {v.get('title', 'Sin título')}</b><br/>
+                    Similitud: {sim_percent:.1f}%<br/>
+                    {format_location(v)}
+                    """
+
+                    folium.Marker(
+                        [lat_j, lon_j],
+                        tooltip=f"{v.get('title', 'Sin título')} ({sim_percent:.1f}%)",
+                        popup=popup_html,
+                        icon=folium.Icon(color=color, icon="briefcase"),
+                    ).add_to(rec_map)
+
+                    bounds.append([lat_j, lon_j])
+
+                # Ajustar zoom para incluir candidato + todas las vacantes
+                if bounds:
+                    rec_map.fit_bounds(bounds)
+
+                # Un solo componente de mapa para recomendaciones
+                st_folium(rec_map, height=400, width=700, key="reco_map")
+
+                st.caption(
+                    "🔵 El marcador azul indica dónde está tu perfil. "
+                    "Los colores de las vacantes varían según la afinidad (verde = alta, rojo = baja)."
+                )
+
+            # ===============================
+            # Tarjetas de detalle de vacantes
+            # ===============================
+            for m in matches:
+                v = m.get("vacancy", {})
+                sim = float(m.get("similarity", 0.0))
+
+                v_loc = format_location(v)
+                v_salary = v.get("salary")
+                v_skills = v.get("skills") or []
+                v_sectors = v.get("sectors") or []
+
+                sim_percent = sim * 100.0
+
+                with st.container():
+                    st.markdown(
+                        f"""
+                        <div style="padding: 0.75rem; margin-bottom: 0.5rem;
+                                    border-radius: 0.5rem;
+                                    border: 1px solid #eee; background-color: #000000;">
+                          <h5 style="margin-bottom: 0.2rem;">
+                            {v.get('id', '?')} · {v.get('title', 'Sin título')}
+                          </h5>
+                          <p style="margin: 0.2rem 0; color: #666;">📍 {v_loc}</p>
+                          <p style="margin: 0.2rem 0;">🔗 Similitud estimada: <b>{sim_percent:.1f}%</b></p>
+                          <p style="margin: 0.2rem 0;">
+                            {f"💰 Salario: {v_salary:,.0f}" if v_salary is not None else ""}
+                          </p>
+                          <p style="margin: 0.2rem 0;">
+                            {"🧩 Skills: " + ", ".join(v_skills) if v_skills else ""}
+                          </p>
+                          <p style="margin: 0.2rem 0;">
+                            {"🏷 Sectores: " + ", ".join(v_sectors) if v_sectors else ""}
+                          </p>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+
+            st.caption(
+                "Las recomendaciones se calculan con el mismo modelo siamesa texto+localización "
+                "que usa el endpoint /vacancies/vector-search del backend."
+            )
 
 
 if __name__ == "__main__":

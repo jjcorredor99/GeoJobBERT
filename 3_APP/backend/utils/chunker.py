@@ -1,4 +1,5 @@
-from utils.chunks_by_tokens import _chunks_by_tokens
+from .chunks_by_tokens import _chunks_by_tokens
+
 
 def chunker(
     texts: dict,
@@ -15,40 +16,44 @@ def chunker(
         f"{name}_chunks_input_ids"
         f"{name}_chunks_attention_mask"
 
-    Todos los valores son listas de ints (JSON-friendly).
+    Each is a list[list[int]] of token ids for each chunk.
     """
-    effective_window = max(8, min(chunk_window, max_length - 2))
-
     out = {}
+
     for name, text in texts.items():
         if text is None:
             text = ""
-        elif not isinstance(text, str):
-            text = str(text)
+        text = str(text)
 
-        ids = tokenizer(text, add_special_tokens=False)["input_ids"]
+        # Tokenize without special tokens
+        tokens = tokenizer.encode(
+            text,
+            add_special_tokens=False,
+            truncation=False,
+        )
 
-        chunks = _chunks_by_tokens(
-            ids,
-            window=effective_window,
+        chunks_ids = _chunks_by_tokens(
+            input_ids=tokens,
+            window=chunk_window,
             overlap=chunk_overlap,
             tokenizer=tokenizer,
         )
 
-        # Fuerza todo a listas de ints puras (sin numpy ni tensores)
-        chunks_py = [list(map(int, ch)) for ch in chunks]
-        masks = [[1] * len(ch) for ch in chunks_py]
+        # Truncate each chunk to max_length
+        chunks_ids = [ids[:max_length] for ids in chunks_ids]
 
-        out[f"{name}_chunks_input_ids"] = chunks_py
-        out[f"{name}_chunks_attention_mask"] = masks
+        out[f"{name}_chunks_input_ids"] = chunks_ids
 
-    # 👉 devolvemos el dict, NO un string JSON
+        # Attention mask = 1 where there is a token
+        chunks_mask = [[1] * len(ids) for ids in chunks_ids]
+        out[f"{name}_chunks_attention_mask"] = chunks_mask
+
     return out
 
 
-def chunk_single_text(
-    text: str,
+def chunker_single(
     name: str,
+    text: str,
     tokenizer,
     chunk_window: int = 250,
     max_length: int = 384,
@@ -62,4 +67,3 @@ def chunk_single_text(
         max_length=max_length,
         chunk_overlap=chunk_overlap,
     )
-

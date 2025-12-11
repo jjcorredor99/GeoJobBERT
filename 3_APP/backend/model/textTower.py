@@ -38,16 +38,15 @@ class TextTower(nn.Module):
         pooled_list = []
         N = flat_ids.size(0)
 
-        for s in range(0, N, self.chunks_subbatch):
-            e = min(s + self.chunks_subbatch, N)
-            out = self.encoder(
-                input_ids=flat_ids[s:e],
-                attention_mask=flat_mask[s:e],
-                return_dict=True,
-            )
-            token_embs = out.last_hidden_state        # [n, T, H]
-            pooled_sub = mean_pool_tokens(token_embs, flat_mask[s:e])  # [n, H]
-            pooled_list.append(pooled_sub)
+
+        out = self.encoder(
+            input_ids=flat_ids,
+            attention_mask=flat_mask,
+            return_dict=True,
+        )
+        token_embs = out.last_hidden_state        # [n, T, H]
+        pooled_sub = mean_pool_tokens(token_embs, flat_mask)  # [n, H]
+        pooled_list.append(pooled_sub)
 
         pooled = torch.cat(pooled_list, dim=0).view(B, C, -1)  # [B, C, H]
         pooled = mean_pool_chunks(pooled)                      # [B, H]
